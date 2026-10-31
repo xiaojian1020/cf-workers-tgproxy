@@ -1,26 +1,31 @@
 # cf-workers-tgproxy 优化说明与 Patch
 
-本文档记录针对 `telegram_webproxy.js` 的 4 项优化：
+本文档记录针对 `telegram_webproxy.js` 的全部优化：
+
+## 第一轮
 
 1. `leases` / `macKeys` 内存治理
 2. `frames()` 半包缓冲
 3. `mkHead()` 热路径优化
 4. `mkCtr()` AES-CTR 流式 keystream
 
-> 注意：本仓库已在 `optimize/hotpath-frame-buffer` 分支提交了完整实现（commit `365235b`）。本文档用于说明改动、便于 review 与回滚。
+> 第一轮完整实现见 commit `365235b`。
+
+## 第二轮
+
+5. `timingSafeEqual()` 统一签名比较
+6. 可选 `ALLOWED_HOSTS` 主机白名单
+7. 分块 base64 编码
+
+> 第二轮完整实现见 commit `1dbde38`，已通过 PR #2 合并到 `main`（merge commit `318e6ed`）。
 
 ## 1. leases / macKeys GC
 
 ### 问题
 
-`macKeys` 与 `leases` 是模块级 `Map`，但没有主动清理：
-
-- 每个 `BOOT`、每个 bridge secret 都可能在 `macKeys` 留下 `CryptoKey`
-- session 过期后，`leases` 仍可能保留记录
+`macKeys` 与 `leases` 是模块级 `Map`，但没有主动清理。
 
 ### 修改
-
-新增：
 
 ```js
 const GC_INTERVAL = 60 * 1000;
@@ -43,40 +48,15 @@ function gc() {
 }
 ```
 
-并在以下入口调用：
-
-```js
-async function verify(v, boot, kind) {
-  gc();
-  ...
-}
-
-const mkSess = async boot => {
-  gc();
-  return mkToken(boot, 'session', Date.now() + 5 * 60 * 1000, rand(12));
-};
-```
+并在 `verify()` 与 `mkSess()` 入口调用 `gc()`。
 
 ## 2. frames() 半包缓冲
 
 ### 问题
 
-原实现：
-
-```js
-function frames(v) {
-  ...
-  const part = getFrame(src, o);
-  if (!part) throw Error();
-  ...
-}
-```
-
-当一条 WebSocket message 只包含部分帧时，会直接抛错并关闭连接。
+原实现在一条 WebSocket message 只包含部分帧时会直接抛错并关闭连接。
 
 ### 修改
-
-改为有状态解析：
 
 ```js
 function mkFrameBuf() {
@@ -115,35 +95,20 @@ function frames(v, state = mkFrameBuf()) {
 并在 `mkSession()` 中保存独立缓冲：
 
 ```js
-const mkSession = ({ secret, sid, onClose, lease }) => {
+const frameBuf = mkFrameBuf();
+...
+for (const frame of frames(b, frameBuf)) {
   ...
-  const frameBuf = mkFrameBuf();
-
-  const onData = (v) => {
-    ...
-    for (const frame of frames(b, frameBuf)) {
-      ...
-    }
-  };
-};
+}
 ```
 
 ## 3. mkHead() 热路径优化
 
 ### 问题
 
-原实现使用：
-
-```js
-badHead.has(dec.decode(head.subarray(0, 4)))
-head.subarray(4, 8).every(v => v === 0)
-```
-
-每次建流都会创建字符串与子数组。
+原实现使用 `TextDecoder` 字符串解码和 `subarray().every()`，每次建流都会创建字符串与子数组。
 
 ### 修改
-
-改为字节级比较：
 
 ```js
 function mkHead(mode, target, media) {
@@ -183,16 +148,9 @@ function mkHead(mode, target, media) {
 
 ### 问题
 
-原实现在非对齐输入时会：
-
-- 创建对齐 `block`
-- 复制输入
-- `slice()` 输出
-- 复杂回退 counter
+原实现在非对齐输入时会创建对齐 `block`、复制输入、`slice()` 输出，并做复杂 counter 回退。
 
 ### 修改
-
-改为维护 16 字节 keystream：
 
 ```js
 const mkCtr = (key, ctr) => {
@@ -255,26 +213,117 @@ const mkCtr = (key, ctr) => {
 };
 ```
 
-## 回归测试
+## 5. timingSafeEqual()
 
-建议至少覆盖：
+### 问题
+
+原 `verify()` 中手写逐字节比较。
+
+### 修改
+
+```js
+function timingSafeEqual(a, b) {
+  if (a.byteLength !== b.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < a.byteLength; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+```
+
+并在 `verify()` 中替换为：
+
+```js
+return timingSafeEqual(sig, want);
+```
+
+## 6. ALLOWED_HOSTS 白名单
+
+### 问题
+
+原 `bridge()` 只校验 hostname 格式，不限制具体域名。
+
+### 修改
+
+`mkCfg()` 新增可选环境变量：
+
+```js
+const mkCfg = ({ SECRET, BOOT, ALLOWED_HOSTS }) => {
+  ...
+  const allow = String(ALLOWED_HOSTS || '')
+    .split(',')
+    .map(v => v.trim().toLowerCase())
+    .filter(Boolean);
+  return { secret, key: getKey(secret), boot, allow };
+};
+```
+
+`bridge()` 增加白名单检查：
+
+```js
+async function bridge(url, secret, allow = []) {
+  ...
+  const host = hostOf(url.hostname);
+  if (allow.length && !allow.includes(host)) return null;
+  ...
+}
+```
+
+路由调用改为：
+
+```js
+host = await bridge(url, cfg.secret, cfg.allow);
+```
+
+### 部署
+
+```txt
+ALLOWED_HOSTS=your-domain.example.com
+```
+
+多个域名用英文逗号分隔；不设置时保持原有行为。
+
+## 7. 分块 base64
+
+### 问题
+
+原实现 `btoa(String.fromCharCode(...b))` 在大 payload 时可能触发调用栈限制。
+
+### 修改
+
+```js
+function b64(v) {
+  const b = v instanceof Uint8Array ? v : new Uint8Array(v);
+  let s = '';
+  for (let i = 0; i < b.byteLength; i += 0x8000) {
+    s += String.fromCharCode(...b.subarray(i, i + 0x8000));
+  }
+  return btoa(s)
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/, '');
+}
+```
+
+## 回归测试
 
 - `frames()`：完整单帧、多帧、半包头、半 payload、超长 buffer
 - `mkCtr()`：0、1、15、16、17、32 字节及跨多块非对齐输入
 - `mkHead()`：不得生成 `0xef` 开头或四个坏前缀
+- `timingSafeEqual()`：相同/不同长度、相同/不同内容
+- `ALLOWED_HOSTS`：白名单内、白名单外、未设置
+- `b64()`：0、1、32767、32768、32769 字节及更大 payload
 - Telegram Web：建立 session、收发消息、关闭 lane
-- AES-CTR：固定 key/counter 下新旧实现输出一致
 
 ## 回滚
 
-如需回滚，直接 revert commit：
+回滚第一轮：
 
 ```bash
 git revert 365235b
 ```
 
-或切回 `main`：
+回滚第二轮：
 
 ```bash
-git checkout main
+git revert 1dbde38
 ```
